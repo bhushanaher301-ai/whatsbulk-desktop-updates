@@ -1,0 +1,86 @@
+name: Assemble verified WhatsBulk Test 1.5.4
+on: workflow_dispatch
+permissions: {}
+concurrency: assemble-whatsbulk-test-154
+jobs:
+  assemble:
+    if: github.repository == 'bhushanaher301-ai/whatsbulk-desktop-updates' && github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Fetch and verify the public model and compression tool
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Fetch($url, $name, $sha) {
+            curl.exe --fail --silent --show-error --location --retry 3 --output $name $url
+            if ($LASTEXITCODE -or (Get-FileHash $name).Hash -ne $sha) { throw "Could not verify $name" }
+          }
+          Fetch 'https://github.com/electron-userland/electron-builder-binaries/releases/download/7zip%401.0.0/7zip-win-x64.tar.gz' 'tool.tgz' 'be071f15bd6da2f78fe81c6ddef2009b0c4d8a51f36b780cb806c7e6df95e1b3'
+          Fetch ('https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/23749fefcc72300e3a2ad315e1317431b06b590a/Qwen3-0.6B-Q8_0.gguf?download=true&run=' + $env:GITHUB_RUN_ID) 'model.gguf' '9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031'
+          tar -xf tool.tgz
+          if ($LASTEXITCODE) { throw 'Tool extraction failed' }
+          & (Get-ChildItem -Recurse -File -Filter 7za.exe | Select-Object -First 1).FullName a -t7z -mx=9 -md=1m -ms=off -mf=BCJ -mmt=4 -mtm=off -mta=off model.7z model.gguf
+          if ($LASTEXITCODE) { throw 'Compression failed' }
+      - name: Reassemble only the approved draft installer
+        shell: python {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          from pathlib import Path
+          import hashlib, http.client, json, os, subprocess
+          repo = 'bhushanaher301-ai/whatsbulk-desktop-updates'
+          resource = 'repos/' + repo + '/releases'
+          release_id = '460265374'
+          target = resource + '/' + release_id
+          name = 'WhatsBulk-Messenger-Test-Setup-1.5.4-x64.exe'
+          sha = 'ed0b0a5c8c9c9c3306d5508490850a25378cfc73cc818fc7e81761581f18ae58'
+          def api(endpoint):
+              return json.loads(subprocess.check_output(['gh', 'api', endpoint]))
+          def draft():
+              obj = api(target)
+              if not obj['draft'] or obj['name'] != 'WhatsBulk Messenger 1.5.4 · Test':
+                  raise RuntimeError('Expected the original Test draft')
+          draft()
+          assets = {a['name']: a for a in api(target + '/assets?per_page=100')}
+          parts = [f'staging-{i:02d}.part' for i in range(11)]
+          metadata = {'update.json':'78da1e2e1682fbc32f060a2cdae468160fcc425524c75a6babcbc176ac4a710c', name+'.blockmap':'b069f2adfacbf41aca45757ab54decd80cf2c2f845ed1dd03edc3eea4b8b5e1a'}
+          for filename, digest in metadata.items():
+              if assets[filename]['digest'] != 'sha256:' + digest:
+                  raise RuntimeError('Unexpected metadata: ' + filename)
+          if name not in assets:
+              with open('parts.bin','wb') as out:
+                  for part in parts:
+                      a = assets[part]
+                      if a['state'] != 'uploaded': raise RuntimeError('Incomplete ' + part)
+                      subprocess.run(['gh','api','-H','Accept: application/octet-stream',resource+'/assets/'+str(a['id'])],stdout=out,check=True)
+              data = Path('parts.bin').read_bytes()
+              if len(data) != 137454634: raise RuntimeError('Wrong parts size')
+              with open('model.7z','rb') as model, open(name,'wb') as out:
+                  model.seek(32)
+                  out.write(data[:41452118])
+                  remaining = 613871571
+                  while remaining:
+                      block = model.read(min(remaining, 4*1024*1024))
+                      if not block: raise RuntimeError('Incomplete model block')
+                      out.write(block)
+                      remaining -= len(block)
+                  out.write(data[41452118:])
+              with open(name,'rb') as f:
+                  if hashlib.file_digest(f,'sha256').hexdigest() != sha: raise RuntimeError('Installer differs from tested build')
+              draft()
+              conn = http.client.HTTPSConnection('uploads.github.com',timeout=600)
+              with open(name,'rb') as f:
+                  conn.request('POST','/'+target+'/assets?name='+name,body=f,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Content-Type':'application/octet-stream','Content-Length':str(Path(name).stat().st_size),'User-Agent':'WhatsBulk-Test-Release'})
+              response = conn.getresponse()
+              if response.status != 201: raise RuntimeError('GitHub upload HTTP '+str(response.status))
+              assets[name] = json.load(response)
+              conn.close()
+          if assets[name]['size'] != 751326205 or assets[name]['digest'] != 'sha256:'+sha: raise RuntimeError('Uploaded EXE mismatch')
+          draft()
+          for part in parts:
+              if part in assets:
+                  subprocess.run(['gh','api','--method','DELETE',resource+'/assets/'+str(assets[part]['id'])],check=True)
+          print('Verified 751326205-byte Test installer in draft.')
