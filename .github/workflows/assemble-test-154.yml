@@ -20,17 +20,17 @@ jobs:
           }
           Fetch 'https://github.com/electron-userland/electron-builder-binaries/releases/download/7zip%401.0.0/7zip-win-x64.tar.gz' 'tool.tgz' 'be071f15bd6da2f78fe81c6ddef2009b0c4d8a51f36b780cb806c7e6df95e1b3'
           Fetch ('https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/23749fefcc72300e3a2ad315e1317431b06b590a/Qwen3-0.6B-Q8_0.gguf?download=true&run=' + $env:GITHUB_RUN_ID) 'model.gguf' '9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031'
+          Fetch 'https://github.com/electron/electron/releases/download/v44.7.0/electron-v44.7.0-win32-x64.zip' 'electron.zip' 'eee30dc8fa1f5ea95490e59f44e46ea68dd24c6e93d22facf70fe5c2d4c2665c'
+          Fetch 'https://github.com/ggml-org/llama.cpp/releases/download/b12669/llama-b12669-bin-win-cpu-x64.zip' 'runtime.zip' '7d14c04f1e56ee6933e290b18a3a362645c864753c9287d278149fe715defdab'
           tar -xf tool.tgz
           if ($LASTEXITCODE) { throw 'Tool extraction failed' }
-          & (Get-ChildItem -Recurse -File -Filter 7za.exe | Select-Object -First 1).FullName a -t7z -mx=9 -md=1m -ms=off -mf=BCJ -mmt=4 -mtm=off -mta=off model.7z model.gguf
-          if ($LASTEXITCODE) { throw 'Compression failed' }
       - name: Reassemble only the approved draft installer
         shell: python {0}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           from pathlib import Path
-          import hashlib, http.client, json, os, subprocess
+          import hashlib, http.client, json, os, re, shutil, subprocess, zipfile
           repo = 'bhushanaher301-ai/whatsbulk-desktop-updates'
           resource = 'repos/' + repo + '/releases'
           release_id = '460265374'
@@ -45,31 +45,65 @@ jobs:
                   raise RuntimeError('Expected the original Test draft')
           draft()
           assets = {a['name']: a for a in api(target + '/assets?per_page=100')}
-          parts = [f'staging-{i:02d}.part' for i in range(11)]
+          parts = [f'bootstrap-{i}.bin' for i in range(4)]
           metadata = {'update.json':'78da1e2e1682fbc32f060a2cdae468160fcc425524c75a6babcbc176ac4a710c', name+'.blockmap':'b069f2adfacbf41aca45757ab54decd80cf2c2f845ed1dd03edc3eea4b8b5e1a'}
           for filename, digest in metadata.items():
               if assets[filename]['digest'] != 'sha256:' + digest:
                   raise RuntimeError('Unexpected metadata: ' + filename)
           if name not in assets:
-              with open('parts.bin','wb') as out:
+              with open('bootstrap.zip','wb') as out:
                   for part in parts:
-                      a = assets[part]
-                      if a['state'] != 'uploaded': raise RuntimeError('Incomplete ' + part)
-                      subprocess.run(['gh','api','-H','Accept: application/octet-stream',resource+'/assets/'+str(a['id'])],stdout=out,check=True)
-              data = Path('parts.bin').read_bytes()
-              if len(data) != 137454634: raise RuntimeError('Wrong parts size')
-              with open('model.7z','rb') as model, open(name,'wb') as out:
-                  model.seek(32)
-                  out.write(data[:41452118])
-                  remaining = 613871571
-                  while remaining:
-                      block = model.read(min(remaining, 4*1024*1024))
-                      if not block: raise RuntimeError('Incomplete model block')
-                      out.write(block)
-                      remaining -= len(block)
-                  out.write(data[41452118:])
-              with open(name,'rb') as f:
-                  if hashlib.file_digest(f,'sha256').hexdigest() != sha: raise RuntimeError('Installer differs from tested build')
+                      asset = assets[part]
+                      if asset['state'] != 'uploaded': raise RuntimeError('Incomplete ' + part)
+                      subprocess.run(['gh','api','-H','Accept: application/octet-stream',resource+'/assets/'+str(asset['id'])],stdout=out,check=True)
+              if hashlib.sha256(Path('bootstrap.zip').read_bytes()).hexdigest() != '08284556a3e8b99e94dcf5dffe0b02b4a7a6840eb12c6f2c0e2e045c27daf605':
+                  raise RuntimeError('Bootstrap checksum mismatch')
+              raw = Path('raw').resolve()
+              with zipfile.ZipFile('bootstrap.zip') as pack, zipfile.ZipFile('electron.zip') as electron, zipfile.ZipFile('runtime.zip') as runtime:
+                  recipe = json.loads(pack.read('recipe.json'))
+                  extra = pack.read('extra.bin')
+                  pages = pack.read('pages.bin')
+                  for key, spec in recipe['files'].items():
+                      destination = (raw/key).resolve()
+                      if raw not in destination.parents: raise RuntimeError('Invalid path')
+                      destination.parent.mkdir(parents=True,exist_ok=True)
+                      if spec[0] == 'model': shutil.copyfile('model.gguf',destination)
+                      elif spec[0] == 'patch':
+                          body = bytearray(electron.read('electron.exe'))
+                          body.extend(bytes(recipe['exeLength']-len(body)))
+                          for i, at in enumerate(recipe['patches']):
+                              n = min(32768,len(body)-at)
+                              body[at:at+n] = pages[32768*i:32768*i+n]
+                          destination.write_bytes(body)
+                          del body
+                      else:
+                          source = electron if spec[0] == 'electron' else runtime
+                          with source.open(spec[1]) as inp, destination.open('wb') as out: shutil.copyfileobj(inp,out)
+              tool = next(Path.cwd().rglob('7za.exe')).resolve()
+              compressed = Path('packed.7z').resolve()
+              subprocess.run([str(tool),'a','-t7z','-mx=9','-md=1m','-ms=off','-mf=BCJ','-mmt=4','-mtm=off','-mta=off',str(compressed),'.'],cwd=raw,check=True,stdout=subprocess.DEVNULL)
+              listing = subprocess.check_output([str(tool),'l','-slt',str(compressed)]).decode(errors='replace').replace('\r','')
+              rows = []
+              for entry in listing.split('\n\n'):
+                  item = dict(re.findall(r'(?m)^([^=\n]+?) = ([^\n]*)$',entry))
+                  if item.get('Packed Size','').isdigit() and item.get('Block','').isdigit():
+                      rows.append((int(item['Block']),item['Path'].replace(chr(92),'/'),int(item['Packed Size'])))
+              pos, offsets = 32, {}
+              for _, filename, size in sorted(rows):
+                  offsets[filename] = (pos,size)
+                  pos += size
+              digest = hashlib.sha256()
+              with compressed.open('rb') as source, open(name,'wb') as out:
+                  for kind, at, size in recipe['layout']:
+                      if kind == 'extra': chunk = extra[at:at+size]
+                      else:
+                          offset, count = offsets[at]
+                          if size != count: raise RuntimeError('Unexpected packed size '+at)
+                          source.seek(offset)
+                          chunk = source.read(size)
+                      out.write(chunk)
+                      digest.update(chunk)
+              if digest.hexdigest() != sha: raise RuntimeError('Installer differs from tested build')
               draft()
               conn = http.client.HTTPSConnection('uploads.github.com',timeout=600)
               with open(name,'rb') as f:
@@ -80,7 +114,7 @@ jobs:
               conn.close()
           if assets[name]['size'] != 751326205 or assets[name]['digest'] != 'sha256:'+sha: raise RuntimeError('Uploaded EXE mismatch')
           draft()
-          for part in parts:
+          for part in parts + [f'staging-{i:02d}.part' for i in range(11)]:
               if part in assets:
                   subprocess.run(['gh','api','--method','DELETE',resource+'/assets/'+str(assets[part]['id'])],check=True)
           print('Verified 751326205-byte Test installer in draft.')
